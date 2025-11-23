@@ -15,17 +15,25 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-# Time-series variables from PhysioNet 2012 (excluding static/categorical features)
-# Note: Weight is excluded as it's primarily a static admission variable
-TIME_SERIES_VARIABLES = [
+# All time-series variables from PhysioNet 2012
+ALL_TIME_SERIES_VARIABLES = [
     'Albumin', 'ALP', 'ALT', 'AST', 'Bilirubin', 'BUN', 'Cholesterol',
     'Creatinine', 'DiasABP', 'FiO2', 'GCS', 'Glucose', 'HCO3', 'HCT',
     'HR', 'K', 'Lactate', 'Mg', 'MAP', 'MechVent', 'Na', 'NIDiasABP',
     'NIMAP', 'NISysABP', 'PaCO2', 'PaO2', 'pH', 'Platelets', 'RespRate',
-    'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 'Urine', 'WBC'
+    'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 'Urine', 'WBC', 'Weight'
 ]
 
-# Static/categorical descriptors (collected at admission, not imputed)
+# Temporal features that should be predicted/imputed (continuous vital signs)
+TEMPORAL_FEATURES = [
+    'DiasABP', 'HR', 'MAP', 'SysABP', 'Urine',  # Will be filtered by missingness
+    'NIDiasABP', 'NIMAP', 'NISysABP', 'RespRate', 'Temp', 'SaO2',
+    'Glucose', 'BUN', 'Creatinine', 'HCT', 'HCO3', 'K', 'Na', 'pH',
+    'PaCO2', 'PaO2', 'Lactate', 'WBC', 'Platelets'
+]
+
+# Static/categorical descriptors (collected at admission, used as input but NOT predicted)
+STATIC_FEATURES = ['Age', 'Gender', 'Height', 'ICUType', 'Weight']
 GENERAL_DESCRIPTORS = ['RecordID', 'Age', 'Gender', 'Height', 'ICUType', 'Weight']
 
 
@@ -47,10 +55,11 @@ class PhysioNetData:
     train: DataSplit
     val: DataSplit
     test: DataSplit
-    features: List[str]
+    features: List[str]              # All features used as input
+    temporal_features: List[str]     # Features to predict/impute
+    static_features: List[str]       # Features used as input only (not predicted)
     dropped_features: List[str]
     missingness_threshold: float
-    scaler: Optional[StandardScaler] = None
     scaler_params: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
 
@@ -141,7 +150,7 @@ def compute_feature_missingness(timeseries: Dict[int, pd.DataFrame],
 def filter_features_by_missingness(timeseries: Dict[int, pd.DataFrame],
                                     threshold: float = 0.6) -> Tuple[List[str], List[str]]:
     """Filter features based on missingness threshold."""
-    missingness = compute_feature_missingness(timeseries, TIME_SERIES_VARIABLES)
+    missingness = compute_feature_missingness(timeseries, ALL_TIME_SERIES_VARIABLES)
 
     kept = [f for f, rate in missingness.items() if rate <= threshold]
     dropped = [f for f, rate in missingness.items() if rate > threshold]
@@ -163,15 +172,8 @@ def filter_patient_timeseries(timeseries: Dict[int, pd.DataFrame],
 
 def remove_outliers_iqr(timeseries: Dict[int, pd.DataFrame],
                         features: List[str],
-                        iqr_multiplier: float = 3.0) -> Tuple[Dict[int, pd.DataFrame], Dict[str, Tuple[float, float]]]:
-    """
-    Remove outliers using IQR method across the entire dataset.
-
-    Returns:
-        filtered_timeseries: Time series with outliers set to NaN
-        bounds: Dict mapping feature to (lower_bound, upper_bound)
-    """
-    # First, collect all values for each feature
+                        iqr_multiplier: float = 3.0) -> Tuple[Dict[int, pd.DataFrame], Dict[str, Tuple[float, float]], int]:
+    """Remove outliers using IQR method across the entire dataset."""
     all_values = {f: [] for f in features}
 
     for ts in timeseries.values():
@@ -183,7 +185,6 @@ def remove_outliers_iqr(timeseries: Dict[int, pd.DataFrame],
             if var in features and val != -1 and not pd.isna(val):
                 all_values[var].append(val)
 
-    # Compute bounds for each feature
     bounds = {}
     for f in features:
         if len(all_values[f]) > 0:
@@ -196,7 +197,6 @@ def remove_outliers_iqr(timeseries: Dict[int, pd.DataFrame],
         else:
             bounds[f] = (-np.inf, np.inf)
 
-    # Filter outliers
     filtered = {}
     outlier_count = 0
 
@@ -294,10 +294,7 @@ def subset_data(patient_ids: List[int],
 
 def timeseries_to_flat_dataframe(timeseries: Dict[int, pd.DataFrame],
                                   features: List[str]) -> pd.DataFrame:
-    """
-    Convert patient timeseries dict to a flat DataFrame for saving.
-    Each row: patient_id, time_hours, feature1, feature2, ...
-    """
+    """Convert patient timeseries dict to a flat DataFrame for saving."""
     rows = []
 
     for pid, ts in timeseries.items():
@@ -336,20 +333,6 @@ def load_physionet_data(data_dir: str = "data",
                         verbose: bool = True) -> PhysioNetData:
     """
     Load PhysioNet 2012 data with preprocessing, splits, and optional saving.
-
-    Args:
-        data_dir: Path to data directory
-        val_ratio: Fraction of training data for validation
-        missingness_threshold: Drop features with missing rate > threshold
-        seed: Random seed for train-val split
-        remove_outliers: Whether to remove outliers using IQR
-        normalize: Whether to normalize using StandardScaler
-        save_xlsx: Whether to save splits as Excel files
-        output_dir: Directory for output files
-        verbose: Print progress
-
-    Returns:
-        PhysioNetData with train, val, test splits and feature metadata
     """
     data_path = Path(data_dir)
 
@@ -377,8 +360,12 @@ def load_physionet_data(data_dir: str = "data",
         train_ts, missingness_threshold
     )
 
+    # Determine which are temporal (to predict) vs all features
+    temporal_features = [f for f in kept_features if f in TEMPORAL_FEATURES]
+
     if verbose:
         print(f"  Kept {len(kept_features)} features, dropped {len(dropped_features)} features")
+        print(f"  Temporal features (to predict): {temporal_features}")
 
     # Filter training time series
     train_ts_filtered = filter_patient_timeseries(train_ts, kept_features)
@@ -445,7 +432,6 @@ def load_physionet_data(data_dir: str = "data",
         if verbose:
             print(f"\nSaving splits to {output_dir}...")
 
-        # Combine train and val for train_val export
         train_val_ts = {**train_split.timeseries, **val_split.timeseries}
         train_val_info = pd.concat([train_split.general_info, val_split.general_info])
         train_val_combined = DataSplit(
@@ -467,6 +453,8 @@ def load_physionet_data(data_dir: str = "data",
         val=val_split,
         test=test_split,
         features=kept_features,
+        temporal_features=temporal_features,
+        static_features=[f for f in kept_features if f not in temporal_features],
         dropped_features=dropped_features,
         missingness_threshold=missingness_threshold,
         scaler_params=scaler_params
@@ -487,11 +475,13 @@ def print_data_summary(data: PhysioNetData) -> None:
     print("-" * 24)
     print(f"{'Total':<12} {data.train.n_patients + data.val.n_patients + data.test.n_patients:>10}")
 
-    print(f"\n{'Features Summary':}")
+    print(f"\nFeatures Summary")
     print("-" * 40)
     print(f"Missingness threshold: {data.missingness_threshold:.0%}")
-    print(f"Kept features ({len(data.features)}): {data.features}")
-    print(f"\nDropped features ({len(data.dropped_features)}): {data.dropped_features}")
+    print(f"All features ({len(data.features)}): {data.features}")
+    print(f"Temporal features to predict ({len(data.temporal_features)}): {data.temporal_features}")
+    if data.static_features:
+        print(f"Static features (input only) ({len(data.static_features)}): {data.static_features}")
 
     if data.scaler_params:
         print(f"\nNormalization parameters (mean, std):")

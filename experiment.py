@@ -50,8 +50,15 @@ class ExperimentResult:
 
 
 def collect_actual_predicted(masked_data: Dict[int, MaskedData],
-                              imputed_data: Dict[int, pd.DataFrame]) -> tuple:
-    """Collect all actual and predicted values from masked positions."""
+                              imputed_data: Dict[int, pd.DataFrame],
+                              temporal_features: List[str] = None) -> tuple:
+    """Collect all actual and predicted values from masked positions.
+
+    Args:
+        masked_data: Dict mapping patient_id to MaskedData
+        imputed_data: Dict mapping patient_id to imputed DataFrame
+        temporal_features: List of temporal features to include (if None, all)
+    """
     all_actual = []
     all_predicted = []
     per_variable = {}
@@ -70,6 +77,9 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
         mask = mdata.mask
 
         for col in original.columns:
+            # Skip if not a temporal feature (when specified)
+            if temporal_features is not None and col not in temporal_features:
+                continue
             if col not in mask.columns:
                 continue
 
@@ -310,10 +320,11 @@ def run_experiment(data: PhysioNetData,
         if verbose:
             print(f"  Applying {config.masking_strategy.value} masking...")
 
+        # Only mask temporal features (not static features)
         masked_data = mask_dataset(
             timeseries=split_data.timeseries,
             strategy=config.masking_strategy,
-            features=data.features,
+            features=data.temporal_features,  # Only mask temporal features
             mask_ratio=config.mask_ratio,
             seed=config.seed,
             pivot_fn=pivot_timeseries
@@ -344,8 +355,10 @@ def run_experiment(data: PhysioNetData,
             print(f"    Overall RMSE: {metrics.overall.rmse:.4f}")
             print(f"    Overall R²:   {metrics.overall.r2:.4f}")
 
-        # Collect actual vs predicted for plotting
-        actual, predicted, per_var = collect_actual_predicted(masked_data, imputed_data)
+        # Collect actual vs predicted for plotting (temporal features only)
+        actual, predicted, per_var = collect_actual_predicted(
+            masked_data, imputed_data, data.temporal_features
+        )
         result.actual_values = actual
         result.predicted_values = predicted
         result.per_variable_results = per_var
@@ -372,8 +385,8 @@ def run_experiment(data: PhysioNetData,
             # Save metrics to Excel
             save_results_xlsx(result, metrics, output_dir, split_name)
 
-            # Save imputed data
-            save_imputed_data_xlsx(masked_data, imputed_data, data.features,
+            # Save imputed data (temporal features only)
+            save_imputed_data_xlsx(masked_data, imputed_data, data.temporal_features,
                                    output_dir / f"{prefix}_{split_name}_imputed_data.xlsx")
 
             if verbose:

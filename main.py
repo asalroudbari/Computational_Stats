@@ -37,7 +37,7 @@ def main():
 
     # Data loading parameters
     VAL_RATIO = 0.2                 # 20% of training data for validation
-    MISSINGNESS_THRESHOLD = 0.6    # Drop features with >60% missing
+    MISSINGNESS_THRESHOLD = 0.7    # Drop features with >60% missing
     SEED = 42
 
     # Preprocessing
