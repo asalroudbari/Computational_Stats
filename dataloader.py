@@ -15,15 +15,17 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-# Time-series variables from PhysioNet 2012
+# Time-series variables from PhysioNet 2012 (excluding static/categorical features)
+# Note: Weight is excluded as it's primarily a static admission variable
 TIME_SERIES_VARIABLES = [
     'Albumin', 'ALP', 'ALT', 'AST', 'Bilirubin', 'BUN', 'Cholesterol',
     'Creatinine', 'DiasABP', 'FiO2', 'GCS', 'Glucose', 'HCO3', 'HCT',
     'HR', 'K', 'Lactate', 'Mg', 'MAP', 'MechVent', 'Na', 'NIDiasABP',
     'NIMAP', 'NISysABP', 'PaCO2', 'PaO2', 'pH', 'Platelets', 'RespRate',
-    'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 'Urine', 'WBC', 'Weight'
+    'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 'Urine', 'WBC'
 ]
 
+# Static/categorical descriptors (collected at admission, not imputed)
 GENERAL_DESCRIPTORS = ['RecordID', 'Age', 'Gender', 'Height', 'ICUType', 'Weight']
 
 
