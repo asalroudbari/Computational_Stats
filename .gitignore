@@ -1,6 +1,9 @@
 # Keep zip files out (extracted data is tracked)
 *.zip
 
+# Output directory (generated results - too large for git)
+output/
+
 # Python
 __pycache__/
 *.py[cod]

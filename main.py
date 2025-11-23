@@ -8,9 +8,9 @@ This project compares three imputation methods:
 3. Bayesian Imputation (MICE)
 
 Under three masking strategies:
-1. Missing Completely At Random (MCAR)
-2. Sequence-end masking
-3. Variable-wise masking
+1. Missing Completely At Random (MCAR) - dataset-wide
+2. Sequence-end masking - patient-wise
+3. Variable-wise masking - dataset-wide
 """
 
 from pathlib import Path
@@ -29,6 +29,7 @@ from experiment import (
 
 def main():
     DATA_DIR = Path(__file__).parent / "data"
+    OUTPUT_DIR = Path(__file__).parent / "output"
 
     # =========================================================================
     # CONFIGURATION
@@ -38,6 +39,11 @@ def main():
     VAL_RATIO = 0.2                 # 20% of training data for validation
     MISSINGNESS_THRESHOLD = 0.6    # Drop features with >60% missing
     SEED = 42
+
+    # Preprocessing
+    REMOVE_OUTLIERS = True         # Remove outliers using IQR method
+    NORMALIZE = True               # Normalize using StandardScaler
+    SAVE_DATA_XLSX = True          # Save train_val and test splits as XLSX
 
     # Experiment parameters
     MASK_RATIO = 0.2               # Mask 20% of observed values
@@ -65,6 +71,10 @@ def main():
         val_ratio=VAL_RATIO,
         missingness_threshold=MISSINGNESS_THRESHOLD,
         seed=SEED,
+        remove_outliers=REMOVE_OUTLIERS,
+        normalize=NORMALIZE,
+        save_xlsx=SAVE_DATA_XLSX,
+        output_dir=OUTPUT_DIR,
         verbose=True
     )
 
@@ -86,11 +96,25 @@ def main():
         data=data,
         config=config,
         evaluate_on=['val'],
+        save_results=True,
+        output_dir=OUTPUT_DIR,
         verbose=True
     )
 
     # Print detailed results
     print("\n" + summarize_results(result.val_metrics))
+
+    print(f"\n{'='*60}")
+    print("Output Files Generated:")
+    print("="*60)
+    print(f"  Directory: {OUTPUT_DIR}")
+    print(f"  - train_val_data.xlsx: Preprocessed training+validation data")
+    print(f"  - test_data.xlsx: Preprocessed test data")
+    print(f"  - *_overall.xlsx: Overall metrics")
+    print(f"  - *_per_variable.xlsx: Per-variable metrics")
+    print(f"  - *_imputed_data.xlsx: Imputed dataset")
+    print(f"  - *_overall_scatter.png: Predicted vs actual plot")
+    print(f"  - *_per_variable_scatter.png: Per-variable scatter plots")
 
 
 def run_full_comparison():
@@ -98,6 +122,7 @@ def run_full_comparison():
     Run a full comparison across all masking strategies and imputation methods.
     """
     DATA_DIR = Path(__file__).parent / "data"
+    OUTPUT_DIR = Path(__file__).parent / "output"
 
     print("=" * 60)
     print("FULL COMPARISON - All Strategies & Methods")
@@ -108,6 +133,10 @@ def run_full_comparison():
         val_ratio=0.2,
         missingness_threshold=0.6,
         seed=42,
+        remove_outliers=True,
+        normalize=True,
+        save_xlsx=True,
+        output_dir=OUTPUT_DIR,
         verbose=True
     )
 
@@ -128,12 +157,20 @@ def run_full_comparison():
         ],
         mask_ratios=[0.2],
         evaluate_on=['val'],
+        save_results=True,
+        output_dir=OUTPUT_DIR,
         seed=42,
         verbose=True
     )
 
     # Print summary table
     print_results_table(results, split='val')
+
+    # Save summary to Excel
+    from experiment import results_to_dataframe
+    summary_df = results_to_dataframe(results, 'val')
+    summary_df.to_excel(OUTPUT_DIR / "experiment_summary.xlsx", index=False)
+    print(f"\nSummary saved to {OUTPUT_DIR / 'experiment_summary.xlsx'}")
 
     return results
 

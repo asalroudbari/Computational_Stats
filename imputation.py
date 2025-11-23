@@ -11,12 +11,14 @@ import numpy as np
 import pandas as pd
 from enum import Enum
 from typing import Optional, Dict
-from scipy.interpolate import UnivariateSpline
-from scipy.optimize import minimize_scalar
+from scipy.interpolate import UnivariateSpline, interp1d
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
+import warnings
+
+warnings.filterwarnings('ignore')
 
 
 class ImputationMethod(Enum):
@@ -36,7 +38,7 @@ def smoothing_spline_impute(data: pd.DataFrame,
 
     Args:
         data: DataFrame with time as index, variables as columns
-        smoothing_factor: Spline smoothing parameter (None = automatic via GCV)
+        smoothing_factor: Spline smoothing parameter (None = automatic)
 
     Returns:
         DataFrame with missing values imputed
@@ -47,45 +49,56 @@ def smoothing_spline_impute(data: pd.DataFrame,
     for col in data.columns:
         series = data[col]
         observed_mask = series.notna()
+        missing_mask = series.isna()
 
-        # Need at least 4 points for cubic spline
-        if observed_mask.sum() < 4:
-            # Fall back to linear interpolation or mean
-            if observed_mask.sum() >= 2:
-                imputed[col] = series.interpolate(method='linear')
-            elif observed_mask.sum() == 1:
+        if missing_mask.sum() == 0:
+            continue
+
+        n_observed = observed_mask.sum()
+
+        # Need at least 2 points for interpolation
+        if n_observed < 2:
+            if n_observed == 1:
                 imputed[col] = series.fillna(series.dropna().iloc[0])
-            # If no observations, leave as NaN
             continue
 
         t_obs = times[observed_mask]
         y_obs = series[observed_mask].values
 
         try:
-            # Fit smoothing spline
-            if smoothing_factor is None:
-                # Use automatic smoothing factor selection
-                # Start with a reasonable default based on data variance
-                spline = UnivariateSpline(t_obs, y_obs, s=len(t_obs))
+            if n_observed < 4:
+                # Use linear interpolation for few points
+                interp_func = interp1d(t_obs, y_obs, kind='linear',
+                                       bounds_error=False, fill_value='extrapolate')
+                y_pred = interp_func(times)
             else:
-                spline = UnivariateSpline(t_obs, y_obs, s=smoothing_factor)
+                # Use smoothing spline with appropriate smoothing factor
+                # s = 0 means interpolation, s > 0 means smoothing
+                # Use variance-based smoothing factor
+                y_var = np.var(y_obs) if np.var(y_obs) > 0 else 1.0
+                s = smoothing_factor if smoothing_factor is not None else n_observed * y_var * 0.1
 
-            # Predict at all time points
-            y_pred = spline(times)
+                try:
+                    spline = UnivariateSpline(t_obs, y_obs, s=s, k=3)
+                    y_pred = spline(times)
+                except Exception:
+                    # Fall back to cubic interpolation
+                    interp_func = interp1d(t_obs, y_obs, kind='cubic',
+                                           bounds_error=False, fill_value='extrapolate')
+                    y_pred = interp_func(times)
 
             # Only fill missing values
-            missing_mask = series.isna()
             imputed.loc[missing_mask, col] = y_pred[missing_mask.values]
 
         except Exception:
-            # Fall back to linear interpolation
-            imputed[col] = series.interpolate(method='linear')
+            # Ultimate fallback: linear interpolation then forward/backward fill
+            imputed[col] = series.interpolate(method='linear').ffill().bfill()
 
     return imputed
 
 
 def gaussian_process_impute(data: pd.DataFrame,
-                            length_scale: float = 1.0,
+                            length_scale: float = 5.0,
                             noise_level: float = 0.1) -> pd.DataFrame:
     """
     Impute missing values using Gaussian Process regression.
@@ -104,21 +117,16 @@ def gaussian_process_impute(data: pd.DataFrame,
     imputed = data.copy()
     times = data.index.values.astype(float).reshape(-1, 1)
 
-    # Define kernel: constant * RBF + white noise
-    kernel = (
-        ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3)) *
-        RBF(length_scale=length_scale, length_scale_bounds=(1e-2, 1e2)) +
-        WhiteKernel(noise_level=noise_level, noise_level_bounds=(1e-5, 1e1))
-    )
-
     for col in data.columns:
         series = data[col]
         observed_mask = series.notna()
         missing_mask = series.isna()
 
-        if observed_mask.sum() < 2 or missing_mask.sum() == 0:
-            # Not enough data or nothing to impute
-            if observed_mask.sum() == 1 and missing_mask.sum() > 0:
+        if missing_mask.sum() == 0:
+            continue
+
+        if observed_mask.sum() < 2:
+            if observed_mask.sum() == 1:
                 imputed[col] = series.fillna(series.dropna().iloc[0])
             continue
 
@@ -132,10 +140,17 @@ def gaussian_process_impute(data: pd.DataFrame,
             y_std = y_obs.std() if y_obs.std() > 0 else 1.0
             y_normalized = (y_obs - y_mean) / y_std
 
+            # Define kernel
+            kernel = (
+                ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3)) *
+                RBF(length_scale=length_scale, length_scale_bounds=(1e-1, 1e2)) +
+                WhiteKernel(noise_level=noise_level, noise_level_bounds=(1e-5, 1e0))
+            )
+
             # Fit GP
             gp = GaussianProcessRegressor(
                 kernel=kernel,
-                n_restarts_optimizer=3,
+                n_restarts_optimizer=2,
                 normalize_y=False,
                 random_state=42
             )
@@ -149,7 +164,7 @@ def gaussian_process_impute(data: pd.DataFrame,
 
         except Exception:
             # Fall back to linear interpolation
-            imputed[col] = series.interpolate(method='linear')
+            imputed[col] = series.interpolate(method='linear').ffill().bfill()
 
     return imputed
 
@@ -176,21 +191,18 @@ def mice_impute(data: pd.DataFrame,
     if data.isna().sum().sum() == 0:
         return data.copy()
 
-    # Check if we have enough data
     if len(data) < 2 or data.shape[1] < 1:
         return data.copy()
 
-    # IterativeImputer (MICE implementation in sklearn)
-    imputer = IterativeImputer(
-        max_iter=max_iter,
-        n_nearest_features=n_nearest_features,
-        random_state=seed,
-        initial_strategy='mean',
-        skip_complete=True
-    )
-
     try:
-        # Fit and transform
+        imputer = IterativeImputer(
+            max_iter=max_iter,
+            n_nearest_features=n_nearest_features,
+            random_state=seed,
+            initial_strategy='mean',
+            skip_complete=True
+        )
+
         imputed_values = imputer.fit_transform(data.values)
         imputed = pd.DataFrame(
             imputed_values,
@@ -200,6 +212,8 @@ def mice_impute(data: pd.DataFrame,
     except Exception:
         # Fall back to simple mean imputation
         imputed = data.fillna(data.mean())
+        # If still NaN (all column was NaN), fill with 0
+        imputed = imputed.fillna(0)
 
     return imputed
 

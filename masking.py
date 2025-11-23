@@ -1,8 +1,10 @@
 """
 Masking Strategies for Missing Value Imputation Evaluation
 
-Implements three masking strategies to artificially create missing values
-from observed data for evaluating imputation methods.
+Implements three masking strategies:
+- MCAR: Dataset-wide random masking
+- SEQUENCE_END: Patient-wise sequence end masking
+- VARIABLE_WISE: Dataset-wide variable masking based on missingness
 """
 
 import numpy as np
@@ -14,9 +16,9 @@ from dataclasses import dataclass
 
 class MaskingStrategy(Enum):
     """Available masking strategies."""
-    MCAR = "mcar"                    # Missing Completely At Random
-    SEQUENCE_END = "sequence_end"    # Mask end of sequences
-    VARIABLE_WISE = "variable_wise"  # Mask high-missingness variables
+    MCAR = "mcar"                    # Missing Completely At Random (dataset-wide)
+    SEQUENCE_END = "sequence_end"    # Mask end of sequences (patient-wise)
+    VARIABLE_WISE = "variable_wise"  # Mask high-missingness variables (dataset-wide)
 
 
 @dataclass
@@ -44,240 +46,324 @@ class MaskedData:
         return self.n_masked / self.n_observed_original
 
 
-def mcar_mask(data: pd.DataFrame, mask_ratio: float = 0.2,
-              seed: int = 42) -> MaskedData:
+@dataclass
+class DatasetMaskedData:
+    """Container for dataset-wide masked data."""
+    patient_data: Dict[int, MaskedData]  # Per-patient masked data
+    global_mask_indices: List[Tuple[int, float, str]]  # (patient_id, time, variable)
+
+
+def sequence_end_mask_patient(data: pd.DataFrame, mask_ratio: float = 0.2) -> MaskedData:
     """
-    Missing Completely At Random (MCAR) masking.
-
-    Randomly masks mask_ratio proportion of observed values.
-
-    Args:
-        data: DataFrame with time as index, variables as columns
-        mask_ratio: Proportion of observed values to mask (0-1)
-        seed: Random seed for reproducibility
-
-    Returns:
-        MaskedData with masked data, mask indicator, and original
-    """
-    rng = np.random.default_rng(seed)
-
-    # Identify observed (non-NaN) positions
-    observed_mask = data.notna()
-    observed_indices = np.argwhere(observed_mask.values)
-
-    if len(observed_indices) == 0:
-        # No observed values to mask
-        return MaskedData(
-            data=data.copy(),
-            mask=pd.DataFrame(False, index=data.index, columns=data.columns),
-            original=data.copy()
-        )
-
-    # Randomly select positions to mask
-    n_to_mask = int(len(observed_indices) * mask_ratio)
-    mask_idx = rng.choice(len(observed_indices), size=n_to_mask, replace=False)
-    positions_to_mask = observed_indices[mask_idx]
-
-    # Create mask DataFrame
-    mask = pd.DataFrame(False, index=data.index, columns=data.columns)
-    for row, col in positions_to_mask:
-        mask.iloc[row, col] = True
-
-    # Apply mask to data
-    masked_data = data.copy()
-    masked_data[mask] = np.nan
-
-    return MaskedData(data=masked_data, mask=mask, original=data.copy())
-
-
-def sequence_end_mask(data: pd.DataFrame, mask_ratio: float = 0.2,
-                      seed: int = 42) -> MaskedData:
-    """
-    Sequence-end masking strategy.
+    Sequence-end masking for a single patient (patient-wise).
 
     Masks the last mask_ratio proportion of observed time points for each variable.
-    This simulates forecasting scenarios where recent observations are missing.
-
-    Args:
-        data: DataFrame with time as index, variables as columns
-        mask_ratio: Proportion of sequence end to mask (0-1)
-        seed: Random seed (unused but kept for API consistency)
-
-    Returns:
-        MaskedData with masked data, mask indicator, and original
     """
     mask = pd.DataFrame(False, index=data.index, columns=data.columns)
 
     for col in data.columns:
-        # Get indices where this variable is observed
         observed_idx = data[col].dropna().index
-
         if len(observed_idx) == 0:
             continue
 
-        # Calculate number of time points to mask from the end
         n_to_mask = max(1, int(len(observed_idx) * mask_ratio))
-
-        # Mask the last n_to_mask observed time points
         indices_to_mask = observed_idx[-n_to_mask:]
         mask.loc[indices_to_mask, col] = True
 
-    # Apply mask to data
     masked_data = data.copy()
     masked_data[mask] = np.nan
 
     return MaskedData(data=masked_data, mask=mask, original=data.copy())
 
 
-def variable_wise_mask(data: pd.DataFrame, mask_ratio: float = 0.2,
-                       seed: int = 42) -> MaskedData:
+def create_dataset_wide_mask_mcar(flat_df: pd.DataFrame,
+                                   features: List[str],
+                                   mask_ratio: float = 0.2,
+                                   seed: int = 42) -> pd.DataFrame:
     """
-    Variable-wise masking strategy.
-
-    Masks entire variables (columns) starting from those with highest natural
-    missingness until approximately mask_ratio of total observed values are masked.
+    Create MCAR mask across the entire dataset.
 
     Args:
-        data: DataFrame with time as index, variables as columns
-        mask_ratio: Target proportion of observed values to mask (0-1)
-        seed: Random seed for tie-breaking
+        flat_df: Flat DataFrame with patient_id, time_hours, and feature columns
+        features: List of feature names
+        mask_ratio: Proportion of observed values to mask
+        seed: Random seed
 
     Returns:
-        MaskedData with masked data, mask indicator, and original
+        DataFrame with mask columns (True = mask this value)
     """
     rng = np.random.default_rng(seed)
 
-    # Calculate missingness rate for each variable
-    n_rows = len(data)
-    var_missingness = {}
-    var_observed_count = {}
+    # Collect all observed positions
+    observed_positions = []
+    for idx, row in flat_df.iterrows():
+        for f in features:
+            if f in flat_df.columns and pd.notna(row[f]):
+                observed_positions.append((idx, f))
 
-    for col in data.columns:
-        n_observed = data[col].notna().sum()
-        var_observed_count[col] = n_observed
-        var_missingness[col] = 1 - (n_observed / n_rows) if n_rows > 0 else 1.0
+    # Randomly select positions to mask
+    n_to_mask = int(len(observed_positions) * mask_ratio)
+    mask_indices = rng.choice(len(observed_positions), size=n_to_mask, replace=False)
 
-    # Sort variables by missingness (highest first), with random tie-breaking
-    variables = list(data.columns)
-    rng.shuffle(variables)  # Shuffle first for random tie-breaking
-    variables_sorted = sorted(variables, key=lambda x: var_missingness[x], reverse=True)
+    # Create mask DataFrame
+    mask_df = flat_df[['patient_id', 'time_hours']].copy()
+    for f in features:
+        mask_df[f] = False
 
-    # Calculate total observed values and target
-    total_observed = sum(var_observed_count.values())
+    for i in mask_indices:
+        idx, f = observed_positions[i]
+        mask_df.at[idx, f] = True
+
+    return mask_df
+
+
+def create_dataset_wide_mask_variable_wise(flat_df: pd.DataFrame,
+                                            features: List[str],
+                                            mask_ratio: float = 0.2,
+                                            seed: int = 42) -> pd.DataFrame:
+    """
+    Create variable-wise mask across the entire dataset.
+
+    Masks entire variables starting from those with highest natural missingness
+    until approximately mask_ratio of total observed values are masked.
+
+    Args:
+        flat_df: Flat DataFrame with patient_id, time_hours, and feature columns
+        features: List of feature names
+        mask_ratio: Target proportion of observed values to mask
+        seed: Random seed for tie-breaking
+
+    Returns:
+        DataFrame with mask columns
+    """
+    rng = np.random.default_rng(seed)
+
+    # Calculate missingness and observed count for each variable
+    var_stats = {}
+    for f in features:
+        if f in flat_df.columns:
+            n_observed = flat_df[f].notna().sum()
+            n_total = len(flat_df)
+            miss_rate = 1 - (n_observed / n_total) if n_total > 0 else 1.0
+            var_stats[f] = {'miss_rate': miss_rate, 'n_observed': n_observed}
+
+    # Sort by missingness (highest first)
+    variables = list(var_stats.keys())
+    rng.shuffle(variables)
+    variables_sorted = sorted(variables, key=lambda x: var_stats[x]['miss_rate'], reverse=True)
+
+    # Calculate target
+    total_observed = sum(var_stats[f]['n_observed'] for f in features if f in var_stats)
     target_masked = int(total_observed * mask_ratio)
 
     # Select variables to mask
-    mask = pd.DataFrame(False, index=data.index, columns=data.columns)
-    masked_count = 0
+    mask_df = flat_df[['patient_id', 'time_hours']].copy()
+    for f in features:
+        mask_df[f] = False
 
+    masked_count = 0
     for var in variables_sorted:
         if masked_count >= target_masked:
             break
 
         # Mask all observed values in this variable
-        observed_positions = data[var].notna()
-        mask.loc[observed_positions, var] = True
-        masked_count += var_observed_count[var]
+        observed_mask = flat_df[var].notna()
+        mask_df.loc[observed_mask, var] = True
+        masked_count += var_stats[var]['n_observed']
 
-    # Apply mask to data
-    masked_data = data.copy()
-    masked_data[mask] = np.nan
-
-    return MaskedData(data=masked_data, mask=mask, original=data.copy())
+    return mask_df
 
 
-def apply_masking(data: pd.DataFrame, strategy: MaskingStrategy,
-                  mask_ratio: float = 0.2, seed: int = 42) -> MaskedData:
+def apply_mask_to_patients(flat_df: pd.DataFrame,
+                           mask_df: pd.DataFrame,
+                           features: List[str]) -> Dict[int, MaskedData]:
     """
-    Apply a masking strategy to data.
+    Apply a dataset-wide mask to individual patient data.
 
     Args:
-        data: DataFrame with time as index, variables as columns
-        strategy: MaskingStrategy enum value
-        mask_ratio: Proportion to mask (interpretation depends on strategy)
-        seed: Random seed
-
-    Returns:
-        MaskedData object
-    """
-    if strategy == MaskingStrategy.MCAR:
-        return mcar_mask(data, mask_ratio, seed)
-    elif strategy == MaskingStrategy.SEQUENCE_END:
-        return sequence_end_mask(data, mask_ratio, seed)
-    elif strategy == MaskingStrategy.VARIABLE_WISE:
-        return variable_wise_mask(data, mask_ratio, seed)
-    else:
-        raise ValueError(f"Unknown masking strategy: {strategy}")
-
-
-def mask_patient_timeseries(timeseries: Dict[int, pd.DataFrame],
-                            strategy: MaskingStrategy,
-                            mask_ratio: float = 0.2,
-                            seed: int = 42,
-                            pivot_fn=None) -> Dict[int, MaskedData]:
-    """
-    Apply masking to all patients' time series.
-
-    Args:
-        timeseries: Dict mapping patient_id to time series DataFrame (long format)
-        strategy: Masking strategy to apply
-        mask_ratio: Proportion to mask
-        seed: Base random seed (incremented per patient for variation)
-        pivot_fn: Function to convert long to wide format (optional)
+        flat_df: Original flat DataFrame
+        mask_df: Mask DataFrame (same shape as flat_df)
+        features: List of feature names
 
     Returns:
         Dict mapping patient_id to MaskedData
     """
-    masked_data = {}
+    patient_data = {}
 
-    for i, (pid, ts) in enumerate(timeseries.items()):
-        # Convert to wide format if needed
-        if pivot_fn is not None:
-            wide_ts = pivot_fn(ts)
-        else:
-            wide_ts = ts
+    for pid in flat_df['patient_id'].unique():
+        # Get patient rows
+        patient_rows = flat_df[flat_df['patient_id'] == pid].copy()
+        mask_rows = mask_df[mask_df['patient_id'] == pid].copy()
 
-        if len(wide_ts) == 0:
-            # Empty time series
-            masked_data[pid] = MaskedData(
-                data=wide_ts,
-                mask=pd.DataFrame(False, index=wide_ts.index, columns=wide_ts.columns),
-                original=wide_ts
-            )
+        if len(patient_rows) == 0:
             continue
 
-        # Apply masking with patient-specific seed
-        patient_seed = seed + i
-        masked_data[pid] = apply_masking(wide_ts, strategy, mask_ratio, patient_seed)
+        # Convert to wide format
+        original = patient_rows.set_index('time_hours')[features].copy()
+        mask = mask_rows.set_index('time_hours')[features].copy()
 
-    return masked_data
+        # Apply mask
+        masked = original.copy()
+        masked[mask] = np.nan
+
+        patient_data[pid] = MaskedData(
+            data=masked,
+            mask=mask.astype(bool),
+            original=original
+        )
+
+    return patient_data
+
+
+def mask_dataset(timeseries: Dict[int, pd.DataFrame],
+                 strategy: MaskingStrategy,
+                 features: List[str],
+                 mask_ratio: float = 0.2,
+                 seed: int = 42,
+                 pivot_fn=None) -> Dict[int, MaskedData]:
+    """
+    Apply masking strategy to entire dataset.
+
+    Args:
+        timeseries: Dict mapping patient_id to time series DataFrame (long format)
+        strategy: Masking strategy to apply
+        features: List of feature names
+        mask_ratio: Proportion to mask
+        seed: Random seed
+        pivot_fn: Function to convert long to wide format
+
+    Returns:
+        Dict mapping patient_id to MaskedData
+    """
+    if strategy == MaskingStrategy.SEQUENCE_END:
+        # Patient-wise masking
+        masked_data = {}
+        for i, (pid, ts) in enumerate(timeseries.items()):
+            if pivot_fn is not None:
+                wide_ts = pivot_fn(ts)
+            else:
+                wide_ts = ts
+
+            if len(wide_ts) == 0:
+                masked_data[pid] = MaskedData(
+                    data=wide_ts,
+                    mask=pd.DataFrame(False, index=wide_ts.index, columns=wide_ts.columns),
+                    original=wide_ts
+                )
+                continue
+
+            masked_data[pid] = sequence_end_mask_patient(wide_ts, mask_ratio)
+
+        return masked_data
+
+    else:
+        # Dataset-wide masking (MCAR or VARIABLE_WISE)
+
+        # First, convert all patient data to flat DataFrame
+        rows = []
+        for pid, ts in timeseries.items():
+            if pivot_fn is not None:
+                wide_ts = pivot_fn(ts)
+            else:
+                wide_ts = ts
+
+            if len(wide_ts) == 0:
+                continue
+
+            for t in wide_ts.index:
+                row = {'patient_id': pid, 'time_hours': t}
+                for f in features:
+                    if f in wide_ts.columns:
+                        row[f] = wide_ts.loc[t, f]
+                    else:
+                        row[f] = np.nan
+                rows.append(row)
+
+        flat_df = pd.DataFrame(rows)
+
+        if len(flat_df) == 0:
+            return {}
+
+        # Create dataset-wide mask
+        if strategy == MaskingStrategy.MCAR:
+            mask_df = create_dataset_wide_mask_mcar(flat_df, features, mask_ratio, seed)
+        elif strategy == MaskingStrategy.VARIABLE_WISE:
+            mask_df = create_dataset_wide_mask_variable_wise(flat_df, features, mask_ratio, seed)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+        # Apply mask to individual patients
+        return apply_mask_to_patients(flat_df, mask_df, features)
+
+
+# Legacy function for backward compatibility
+def mask_patient_timeseries(timeseries: Dict[int, pd.DataFrame],
+                            strategy: MaskingStrategy,
+                            mask_ratio: float = 0.2,
+                            seed: int = 42,
+                            pivot_fn=None,
+                            features: List[str] = None) -> Dict[int, MaskedData]:
+    """
+    Legacy wrapper for mask_dataset.
+    """
+    if features is None:
+        # Infer features from first patient
+        for ts in timeseries.values():
+            if pivot_fn is not None:
+                wide = pivot_fn(ts)
+            else:
+                wide = ts
+            if len(wide) > 0:
+                features = list(wide.columns)
+                break
+
+    if features is None:
+        features = []
+
+    return mask_dataset(timeseries, strategy, features, mask_ratio, seed, pivot_fn)
 
 
 if __name__ == "__main__":
     # Demo/test
     np.random.seed(42)
 
-    # Create sample data
-    times = [0.1, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0]
-    data = pd.DataFrame({
-        'HR': [72, 75, np.nan, 80, 78, 76, 74],
-        'Temp': [36.5, np.nan, 37.0, 37.2, np.nan, 36.8, 36.9],
-        'BP': [120, 118, 122, np.nan, np.nan, 115, 117]
-    }, index=times)
-    data.index.name = 'time_hours'
+    # Create sample data for 3 patients
+    def create_patient_data(pid, seed):
+        rng = np.random.default_rng(seed)
+        times = [0.1, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0]
+        data = pd.DataFrame({
+            'HR': rng.normal(75, 5, len(times)),
+            'Temp': rng.normal(37, 0.5, len(times)),
+            'BP': rng.normal(120, 10, len(times))
+        }, index=times)
+        data.index.name = 'time_hours'
+        # Add some natural missing
+        data.iloc[2, 0] = np.nan
+        data.iloc[4, 1] = np.nan
+        return data
 
-    print("Original Data:")
-    print(data)
-    print(f"\nObserved values: {data.notna().sum().sum()}")
+    timeseries = {
+        1: create_patient_data(1, 42),
+        2: create_patient_data(2, 43),
+        3: create_patient_data(3, 44)
+    }
+
+    features = ['HR', 'Temp', 'BP']
+
+    print("Testing masking strategies on 3 patients\n")
 
     for strategy in MaskingStrategy:
         print(f"\n{'='*50}")
         print(f"Strategy: {strategy.value}")
         print('='*50)
 
-        result = apply_masking(data, strategy, mask_ratio=0.3, seed=42)
-        print(f"\nMasked Data:")
-        print(result.data)
-        print(f"\nMask (True = artificially masked):")
-        print(result.mask)
-        print(f"\nMasked {result.n_masked} values ({result.mask_ratio_actual:.1%} of observed)")
+        result = mask_dataset(timeseries, strategy, features, mask_ratio=0.3, seed=42)
+
+        total_masked = sum(m.n_masked for m in result.values())
+        total_observed = sum(m.n_observed_original for m in result.values())
+
+        print(f"Total masked: {total_masked} / {total_observed} observed "
+              f"({total_masked/total_observed:.1%})")
+
+        for pid, mdata in result.items():
+            print(f"\n  Patient {pid}: masked {mdata.n_masked} values")
