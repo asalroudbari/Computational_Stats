@@ -18,6 +18,12 @@ from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 import warnings
 
+try:
+    from hmmlearn.hmm import GaussianHMM
+    _HMMLEARN_AVAILABLE = True
+except ImportError:
+    _HMMLEARN_AVAILABLE = False
+
 warnings.filterwarnings('ignore')
 
 
@@ -26,6 +32,7 @@ class ImputationMethod(Enum):
     SMOOTHING_SPLINE = "smoothing_spline"
     GAUSSIAN_PROCESS = "gaussian_process"
     MICE = "mice"
+    HMM = "hmm"
 
 
 def smoothing_spline_impute(data: pd.DataFrame,
@@ -176,6 +183,81 @@ def gaussian_process_impute(data: pd.DataFrame,
     return imputed
 
 
+def hmm_impute(data: pd.DataFrame,
+               n_states: int = 4,
+               max_iter: int = 100,
+               random_state: int = 42) -> pd.DataFrame:
+    """
+    Impute missing values using a Gaussian Hidden Markov Model.
+
+    The HMM is fit on the multivariate time series with missing entries
+    temporarily filled via simple forward/backward fill. After fitting,
+    latent state posteriors (gamma) are used to compute the expected
+    observation at each time step:
+        E[x_t | data] ≈ sum_k gamma_tk * mean_k
+
+    Returns:
+        DataFrame with missing values imputed
+    """
+    if not _HMMLEARN_AVAILABLE:
+        raise ImportError("hmmlearn is required for HMM imputation. "
+                          "Install via 'pip install hmmlearn'.")
+
+    if data.isna().sum().sum() == 0:
+        return data.copy()
+
+    # Simple fill to create a complete matrix for HMM fitting
+    filled = data.copy()
+    filled = filled.bfill().ffill()
+
+    # If still NaNs (all-NaN column), fill with column-wise zeros
+    nan_cols = filled.columns[filled.isna().all()]
+    for col in nan_cols:
+        filled[col] = 0.0
+    filled = filled.fillna(0.0)
+
+    X = filled.values.astype(float)
+
+    hmm = GaussianHMM(
+        n_components=n_states,
+        covariance_type="diag",
+        n_iter=max_iter,
+        random_state=random_state
+    )
+    hmm.fit(X)
+
+    def _normalize_probs(vec: np.ndarray) -> np.ndarray:
+        vec = np.nan_to_num(vec.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+        total = vec.sum()
+        if total <= 0 or not np.isfinite(total):
+            vec = np.full_like(vec, 1.0 / len(vec))
+        else:
+            vec = vec / total
+        return vec
+
+    hmm.startprob_ = _normalize_probs(hmm.startprob_)
+    hmm.transmat_ = np.vstack([_normalize_probs(row) for row in hmm.transmat_])
+
+    # Posterior state responsibilities gamma_tk
+    _, gamma = hmm.score_samples(X)
+
+    # Expected observation at each time: sum_k gamma_tk * mean_k
+    means = hmm.means_  # shape (K, D)
+    expected_X = gamma @ means  # (T, D)
+
+    expected_df = pd.DataFrame(
+        expected_X,
+        index=data.index,
+        columns=data.columns
+    )
+
+    missing_mask = data.isna()
+    imputed = data.copy()
+    imputed = imputed.mask(missing_mask, expected_df)
+
+    return imputed
+
+
 def mice_impute(data: pd.DataFrame,
                 max_iter: int = 10,
                 n_nearest_features: Optional[int] = None,
@@ -225,14 +307,9 @@ def mice_impute(data: pd.DataFrame,
     return imputed
 
 
-def impute(data: pd.DataFrame, method: ImputationMethod, **kwargs) -> pd.DataFrame:
+def impute(data: pd.DataFrame, method: ImputationMethod, **kwargs):
     """
     Apply an imputation method to data.
-
-    Args:
-        data: DataFrame with time as index, variables as columns
-        method: ImputationMethod enum value
-        **kwargs: Method-specific parameters
 
     Returns:
         DataFrame with missing values imputed
@@ -243,6 +320,8 @@ def impute(data: pd.DataFrame, method: ImputationMethod, **kwargs) -> pd.DataFra
         return gaussian_process_impute(data, **kwargs)
     elif method == ImputationMethod.MICE:
         return mice_impute(data, **kwargs)
+    elif method == ImputationMethod.HMM:
+        return hmm_impute(data, **kwargs)
     else:
         raise ValueError(f"Unknown imputation method: {method}")
 
@@ -253,23 +332,20 @@ def impute_patient_timeseries(masked_data: Dict,
     """
     Apply imputation to all patients' masked time series.
 
-    Args:
-        masked_data: Dict mapping patient_id to MaskedData objects
-        method: Imputation method to use
-        **kwargs: Method-specific parameters
-
     Returns:
-        Dict mapping patient_id to imputed DataFrame
+        Dict[patient_id, imputed DataFrame]
     """
     imputed_data = {}
 
     for pid, mdata in masked_data.items():
         if hasattr(mdata, 'data'):
             # MaskedData object
-            imputed_data[pid] = impute(mdata.data, method, **kwargs)
+            df = mdata.data
         else:
             # Plain DataFrame
-            imputed_data[pid] = impute(mdata, method, **kwargs)
+            df = mdata
+
+        imputed_data[pid] = impute(df, method, **kwargs)
 
     return imputed_data
 
@@ -296,6 +372,11 @@ if __name__ == "__main__":
         print(f"Method: {method.value}")
         print('='*50)
 
-        imputed = impute(data, method)
+        try:
+            imputed = impute(data, method)
+        except ImportError as e:
+            print(f"Skipping method '{method.value}': {e}")
+            continue
+
         print(f"\nImputed Data:")
         print(imputed.round(2))

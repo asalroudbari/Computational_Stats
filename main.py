@@ -59,7 +59,8 @@ def main():
     IMPUTATION_METHODS = [
         ImputationMethod.SMOOTHING_SPLINE,
         ImputationMethod.GAUSSIAN_PROCESS,
-        ImputationMethod.MICE
+        ImputationMethod.MICE,
+        ImputationMethod.HMM
     ]
 
     # =========================================================================
@@ -107,14 +108,18 @@ def main():
         os.makedirs(method_output_dir, exist_ok=True)
 
         # Evaluate on validation set
-        result = run_experiment(
-            data=data,
-            config=config,
-            evaluate_on=['val'],
-            save_results=True,
-            output_dir=method_output_dir,
-            verbose=True
-        )
+        try:
+            result = run_experiment(
+                data=data,
+                config=config,
+                evaluate_on=['val'],
+                save_results=True,
+                output_dir=method_output_dir,
+                verbose=True
+            )
+        except ImportError as exc:
+            print(f"Skipping method '{method.value}': {exc}")
+            continue
 
         # Store the full result object for downstream processing
         all_results.append(result)
@@ -169,9 +174,10 @@ def run_full_comparison():
             MaskingStrategy.VARIABLE_WISE
         ],
         imputation_methods=[
-            ImputationMethod.SMOOTHING_SPLINE,
-            ImputationMethod.GAUSSIAN_PROCESS,
-            ImputationMethod.MICE
+            # ImputationMethod.SMOOTHING_SPLINE,
+            # ImputationMethod.GAUSSIAN_PROCESS,
+            # ImputationMethod.MICE,
+            ImputationMethod.HMM
         ],
         mask_ratios=[0.2],
         evaluate_on=['val'],
