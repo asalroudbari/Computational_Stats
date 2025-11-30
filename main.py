@@ -14,6 +14,7 @@ Under three masking strategies:
 """
 
 from pathlib import Path
+import os  # Add this import to handle directory creation
 
 from dataloader import load_physionet_data, print_data_summary
 from masking import MaskingStrategy
@@ -30,6 +31,9 @@ from experiment import (
 def main():
     DATA_DIR = Path(__file__).parent / "data"
     OUTPUT_DIR = Path(__file__).parent / "output"
+
+    # Ensure output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # =========================================================================
     # CONFIGURATION
@@ -50,13 +54,13 @@ def main():
 
     # Select masking strategy (choose one)
     MASKING_STRATEGY = MaskingStrategy.MCAR
-    # MASKING_STRATEGY = MaskingStrategy.SEQUENCE_END
-    # MASKING_STRATEGY = MaskingStrategy.VARIABLE_WISE
 
-    # Select imputation method (choose one)
-    IMPUTATION_METHOD = ImputationMethod.SMOOTHING_SPLINE
-    # IMPUTATION_METHOD = ImputationMethod.GAUSSIAN_PROCESS
-    # IMPUTATION_METHOD = ImputationMethod.MICE
+    # List of imputation methods to evaluate
+    IMPUTATION_METHODS = [
+        ImputationMethod.SMOOTHING_SPLINE,
+        ImputationMethod.GAUSSIAN_PROCESS,
+        ImputationMethod.MICE
+    ]
 
     # =========================================================================
     # LOAD DATA
@@ -81,40 +85,51 @@ def main():
     print_data_summary(data)
 
     # =========================================================================
-    # RUN SINGLE EXPERIMENT
+    # RUN EXPERIMENTS FOR ALL IMPUTATION METHODS
     # =========================================================================
 
-    config = ExperimentConfig(
-        masking_strategy=MASKING_STRATEGY,
-        imputation_method=IMPUTATION_METHOD,
-        mask_ratio=MASK_RATIO,
-        seed=SEED
-    )
+    all_results = []
 
-    # Evaluate on validation set
-    result = run_experiment(
-        data=data,
-        config=config,
-        evaluate_on=['val'],
-        save_results=True,
-        output_dir=OUTPUT_DIR,
-        verbose=True
-    )
+    for method in IMPUTATION_METHODS:
+        print(f"\n{'='*60}")
+        print(f"Running experiment with {method.name}")
+        print(f"{'='*60}")
 
-    # Print detailed results
-    print("\n" + summarize_results(result.val_metrics))
+        config = ExperimentConfig(
+            masking_strategy=MASKING_STRATEGY,
+            imputation_method=method,
+            mask_ratio=MASK_RATIO,
+            seed=SEED
+        )
 
-    print(f"\n{'='*60}")
-    print("Output Files Generated:")
-    print("="*60)
-    print(f"  Directory: {OUTPUT_DIR}")
-    print(f"  - train_val_data.xlsx: Preprocessed training+validation data")
-    print(f"  - test_data.xlsx: Preprocessed test data")
-    print(f"  - *_overall.xlsx: Overall metrics")
-    print(f"  - *_per_variable.xlsx: Per-variable metrics")
-    print(f"  - *_imputed_data.xlsx: Imputed dataset")
-    print(f"  - *_overall_scatter.png: Predicted vs actual plot")
-    print(f"  - *_per_variable_scatter.png: Per-variable scatter plots")
+        # Ensure method-specific output directory exists
+        method_output_dir = OUTPUT_DIR / method.name
+        os.makedirs(method_output_dir, exist_ok=True)
+
+        # Evaluate on validation set
+        result = run_experiment(
+            data=data,
+            config=config,
+            evaluate_on=['val'],
+            save_results=True,
+            output_dir=method_output_dir,
+            verbose=True
+        )
+
+        # Store the full result object for downstream processing
+        all_results.append(result)
+
+        # Print detailed results
+        print("\n" + summarize_results(result.val_metrics))
+
+    # =========================================================================
+    # SAVE COMPARISON METRICS
+    # =========================================================================
+
+    from experiment import results_to_dataframe
+    summary_df = results_to_dataframe(all_results, 'val')
+    summary_df.to_excel(OUTPUT_DIR / "imputation_comparison_summary.xlsx", index=False)
+    print(f"\nComparison summary saved to {OUTPUT_DIR / 'imputation_comparison_summary.xlsx'}")
 
 
 def run_full_comparison():
@@ -123,6 +138,9 @@ def run_full_comparison():
     """
     DATA_DIR = Path(__file__).parent / "data"
     OUTPUT_DIR = Path(__file__).parent / "output"
+
+    # Ensure output directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print("=" * 60)
     print("FULL COMPARISON - All Strategies & Methods")
@@ -176,7 +194,7 @@ def run_full_comparison():
 
 
 if __name__ == "__main__":
-    # Run single experiment with configured parameters
+    # Run experiments for all imputation methods
     main()
 
     # Uncomment below to run full comparison:

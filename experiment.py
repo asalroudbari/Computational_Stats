@@ -435,21 +435,24 @@ def run_experiment_grid(data: PhysioNetData,
     return results
 
 
-def results_to_dataframe(results: List[ExperimentResult],
-                         split: str = 'val') -> pd.DataFrame:
-    """Convert experiment results to a summary DataFrame."""
-    rows = []
+def results_to_dataframe(all_results, split: str):
+    # all_results may contain plain result objects or tuples like (result, config, ...)
+    processed_results = []
+    for item in all_results:
+        # Unpack if tuple; assume first element is the actual result object
+        r = item[0] if isinstance(item, tuple) and item else item
+        processed_results.append(r)
 
-    for r in results:
-        if split == 'train':
-            metrics = r.train_metrics
-        elif split == 'val':
+    # Replace occurrences of "for r in all_results" with "for r in processed_results"
+    rows = []
+    for r in processed_results:
+        if split == "val":
             metrics = r.val_metrics
-        elif split == 'test':
+        elif split == "test":
             metrics = r.test_metrics
         else:
-            continue
-
+            metrics = r.train_metrics
+        # ...existing code that builds `rows` from `metrics`...
         if metrics is None:
             continue
 
