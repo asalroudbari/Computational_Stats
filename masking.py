@@ -220,27 +220,38 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
                  features: List[str],
                  mask_ratio: float = 0.2,
                  seed: int = 42,
-                 pivot_fn=None) -> Dict[int, MaskedData]:
+                 pivot_fn=None,
+                 general_info: pd.DataFrame = None) -> Dict[int, MaskedData]:
     """
     Apply masking strategy to entire dataset.
 
     Args:
         timeseries: Dict mapping patient_id to time series DataFrame (long format)
         strategy: Masking strategy to apply
-        features: List of feature names
+        features: List of feature names (temporal features to mask)
         mask_ratio: Proportion to mask
         seed: Random seed
         pivot_fn: Function to convert long to wide format
+        general_info: DataFrame with static features (Age, Gender, Height, ICUType)
 
     Returns:
         Dict mapping patient_id to MaskedData
     """
+    # Helper to get patient info
+    def get_patient_info(pid):
+        if general_info is not None and len(general_info) > 0:
+            patient_row = general_info[general_info['RecordID'] == pid]
+            if len(patient_row) > 0:
+                return patient_row.iloc[0].to_dict()
+        return None
+
     if strategy == MaskingStrategy.SEQUENCE_END:
         # Patient-wise masking
         masked_data = {}
         for i, (pid, ts) in enumerate(timeseries.items()):
             if pivot_fn is not None:
-                wide_ts = pivot_fn(ts)
+                patient_info = get_patient_info(pid)
+                wide_ts = pivot_fn(ts, patient_info)
             else:
                 wide_ts = ts
 
@@ -252,7 +263,14 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
                 )
                 continue
 
-            masked_data[pid] = sequence_end_mask_patient(wide_ts, mask_ratio)
+            # Mask only the temporal features (not Age, Gender, Height, ICUType)
+            masked_data[pid] = sequence_end_mask_patient(wide_ts[features], mask_ratio)
+            # Add back static features to the masked data
+            for col in wide_ts.columns:
+                if col not in features and col in wide_ts.columns:
+                    masked_data[pid].data[col] = wide_ts[col]
+                    masked_data[pid].original[col] = wide_ts[col]
+                    masked_data[pid].mask[col] = False
 
         return masked_data
 
@@ -263,16 +281,20 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
         rows = []
         for pid, ts in timeseries.items():
             if pivot_fn is not None:
-                wide_ts = pivot_fn(ts)
+                patient_info = get_patient_info(pid)
+                wide_ts = pivot_fn(ts, patient_info)
             else:
                 wide_ts = ts
 
             if len(wide_ts) == 0:
                 continue
 
+            # Extract all features (temporal + static)
+            all_features = list(wide_ts.columns)
+
             for t in wide_ts.index:
                 row = {'patient_id': pid, 'time_hours': t}
-                for f in features:
+                for f in all_features:
                     if f in wide_ts.columns:
                         row[f] = wide_ts.loc[t, f]
                     else:
@@ -284,7 +306,7 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
         if len(flat_df) == 0:
             return {}
 
-        # Create dataset-wide mask
+        # Create dataset-wide mask (only for temporal features)
         if strategy == MaskingStrategy.MCAR:
             mask_df = create_dataset_wide_mask_mcar(flat_df, features, mask_ratio, seed)
         elif strategy == MaskingStrategy.VARIABLE_WISE:
@@ -292,8 +314,15 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
-        # Apply mask to individual patients
-        return apply_mask_to_patients(flat_df, mask_df, features)
+        # Add columns for static features (never masked)
+        static_features = [c for c in flat_df.columns if c not in features and c not in ['patient_id', 'time_hours']]
+        for f in static_features:
+            if f not in mask_df.columns:
+                mask_df[f] = False
+
+        # Apply mask to individual patients (now includes static features)
+        all_features_to_apply = features + static_features
+        return apply_mask_to_patients(flat_df, mask_df, all_features_to_apply)
 
 
 # Legacy function for backward compatibility

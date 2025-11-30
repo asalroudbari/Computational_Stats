@@ -67,24 +67,25 @@ def smoothing_spline_impute(data: pd.DataFrame,
 
         try:
             if n_observed < 4:
-                # Use linear interpolation for few points
+                # Use linear interpolation with constant extrapolation for few points
                 interp_func = interp1d(t_obs, y_obs, kind='linear',
-                                       bounds_error=False, fill_value='extrapolate')
+                                       bounds_error=False, fill_value=(y_obs[0], y_obs[-1]))
                 y_pred = interp_func(times)
             else:
-                # Use smoothing spline with appropriate smoothing factor
-                # s = 0 means interpolation, s > 0 means smoothing
-                # Use variance-based smoothing factor
-                y_var = np.var(y_obs) if np.var(y_obs) > 0 else 1.0
-                s = smoothing_factor if smoothing_factor is not None else n_observed * y_var * 0.1
-
+                # Use cubic spline with constant extrapolation
                 try:
-                    spline = UnivariateSpline(t_obs, y_obs, s=s, k=3)
-                    y_pred = spline(times)
+                    # Use scipy CubicSpline which extrapolates with constant values by default
+                    from scipy.interpolate import CubicSpline
+                    spline = CubicSpline(t_obs, y_obs, bc_type='natural', extrapolate=False)
+                    y_pred = spline(times, extrapolate=False)
+                    # Fill extrapolated areas with nearest boundary value
+                    y_pred = np.where(np.isnan(y_pred),
+                                    np.where(times < t_obs.min(), y_obs[0], y_obs[-1]),
+                                    y_pred)
                 except Exception:
-                    # Fall back to cubic interpolation
-                    interp_func = interp1d(t_obs, y_obs, kind='cubic',
-                                           bounds_error=False, fill_value='extrapolate')
+                    # Fall back to linear with constant extrapolation
+                    interp_func = interp1d(t_obs, y_obs, kind='linear',
+                                          bounds_error=False, fill_value=(y_obs[0], y_obs[-1]))
                     y_pred = interp_func(times)
 
             # Only fill missing values
@@ -159,6 +160,12 @@ def gaussian_process_impute(data: pd.DataFrame,
             # Predict at missing points
             y_pred_normalized = gp.predict(t_missing)
             y_pred = y_pred_normalized * y_std + y_mean
+
+            # Clip to observed data range + margin (3 std devs)
+            # to prevent extreme predictions
+            y_min = y_obs.min() - 3 * y_std
+            y_max = y_obs.max() + 3 * y_std
+            y_pred = np.clip(y_pred, y_min, y_max)
 
             imputed.loc[missing_mask, col] = y_pred
 

@@ -321,13 +321,15 @@ def run_experiment(data: PhysioNetData,
             print(f"  Applying {config.masking_strategy.value} masking...")
 
         # Only mask temporal features (not static features)
+        # Static features (Age, Gender, Height, ICUType) added but never masked
         masked_data = mask_dataset(
             timeseries=split_data.timeseries,
             strategy=config.masking_strategy,
             features=data.temporal_features,  # Only mask temporal features
             mask_ratio=config.mask_ratio,
             seed=config.seed,
-            pivot_fn=pivot_timeseries
+            pivot_fn=pivot_timeseries,
+            general_info=split_data.general_info  # Add static features
         )
 
         total_masked = sum(m.n_masked for m in masked_data.values())

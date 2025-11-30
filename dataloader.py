@@ -114,15 +114,34 @@ def load_raw_dataset(data_dir: Path, dataset_name: str,
     return pd.DataFrame(general_list), timeseries
 
 
-def pivot_timeseries(ts: pd.DataFrame) -> pd.DataFrame:
-    """Convert long-format time series to wide format, replacing -1 with NaN."""
+def pivot_timeseries(ts: pd.DataFrame, patient_info: dict = None) -> pd.DataFrame:
+    """Convert long-format time series to wide format, replacing -1 with NaN.
+
+    Args:
+        ts: Long-format time series with columns [time_hours, variable, value]
+        patient_info: Optional dict with static features (Age, Gender, Height, ICUType)
+                     If provided, adds these as constant columns to all time points
+
+    Returns:
+        Wide-format DataFrame with time_hours as index, variables as columns
+    """
     if len(ts) == 0:
         return pd.DataFrame()
 
     pivoted = ts.pivot_table(
         index='time_hours', columns='variable', values='value', aggfunc='mean'
     )
-    return pivoted.replace(-1, np.nan)
+    pivoted = pivoted.replace(-1, np.nan)
+
+    # Add static features as constant columns if provided
+    if patient_info is not None:
+        for key in ['Age', 'Gender', 'Height', 'ICUType']:
+            if key in patient_info:
+                val = patient_info[key]
+                # Replace -1 with NaN for missing static features
+                pivoted[key] = np.nan if val == -1 else val
+
+    return pivoted
 
 
 def compute_feature_missingness(timeseries: Dict[int, pd.DataFrame],
