@@ -7,16 +7,21 @@ Implements three imputation approaches:
 3. MICE - Multiple Imputation by Chained Equations (Bayesian)
 """
 
+import os
+from contextlib import contextmanager
 import numpy as np
 import pandas as pd
 from enum import Enum
 from typing import Optional, Dict
 from scipy.interpolate import UnivariateSpline, interp1d
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 import warnings
+import joblib
+from joblib import Parallel, delayed
+from tqdm.auto import tqdm
 
 try:
     from hmmlearn.hmm import GaussianHMM
@@ -107,7 +112,10 @@ def smoothing_spline_impute(data: pd.DataFrame,
 
 def gaussian_process_impute(data: pd.DataFrame,
                             length_scale: float = 5.0,
-                            noise_level: float = 0.1) -> pd.DataFrame:
+                            noise_level: float = 0.1,
+                            max_training_points: int = 100,
+                            random_state: int = 42,
+                            optimize_hyperparams: bool = False) -> pd.DataFrame:
     """
     Impute missing values using Gaussian Process regression.
 
@@ -122,6 +130,7 @@ def gaussian_process_impute(data: pd.DataFrame,
     Returns:
         DataFrame with missing values imputed
     """
+    rng = np.random.default_rng(random_state)
     imputed = data.copy()
     times = data.index.values.astype(float).reshape(-1, 1)
 
@@ -148,21 +157,32 @@ def gaussian_process_impute(data: pd.DataFrame,
             y_std = y_obs.std() if y_obs.std() > 0 else 1.0
             y_normalized = (y_obs - y_mean) / y_std
 
+            # Downsample observed points if too many (GP training is cubic)
+            t_obs_fit = t_obs
+            y_norm_fit = y_normalized
+            if max_training_points and len(y_obs) > max_training_points:
+                subset_idx = rng.choice(len(y_obs), size=max_training_points, replace=False)
+                t_obs_fit = t_obs[subset_idx]
+                y_norm_fit = y_normalized[subset_idx]
+
             # Define kernel
             kernel = (
-                ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3)) *
-                RBF(length_scale=length_scale, length_scale_bounds=(1e-1, 1e2)) +
-                WhiteKernel(noise_level=noise_level, noise_level_bounds=(1e-5, 1e0))
+                ConstantKernel(1.0 if optimize_hyperparams else 1.0, constant_value_bounds=(1e-3, 1e3))
+                * RBF(length_scale=length_scale, length_scale_bounds=(1e-1, 1e2))
             )
 
-            # Fit GP
+            optimizer = "fmin_l_bfgs_b" if optimize_hyperparams else None
+            n_restarts = 2 if optimize_hyperparams else 0
+
             gp = GaussianProcessRegressor(
                 kernel=kernel,
-                n_restarts_optimizer=2,
+                alpha=noise_level ** 2,
+                optimizer=optimizer,
+                n_restarts_optimizer=n_restarts,
                 normalize_y=False,
-                random_state=42
+                random_state=random_state
             )
-            gp.fit(t_obs, y_normalized)
+            gp.fit(t_obs_fit, y_norm_fit)
 
             # Predict at missing points
             y_pred_normalized = gp.predict(t_missing)
@@ -185,7 +205,8 @@ def gaussian_process_impute(data: pd.DataFrame,
 
 def hmm_impute(data: pd.DataFrame,
                n_states: int = 4,
-               max_iter: int = 100,
+               max_iter: int = 50,
+               max_time_steps: Optional[int] = 300,
                random_state: int = 42) -> pd.DataFrame:
     """
     Impute missing values using a Gaussian Hidden Markov Model.
@@ -218,13 +239,21 @@ def hmm_impute(data: pd.DataFrame,
 
     X = filled.values.astype(float)
 
+    X_fit = X
+    if max_time_steps is not None and len(X) > max_time_steps:
+        # Downsample uniformly to cap the time steps used for fitting
+        indices = np.linspace(0, len(X) - 1, max_time_steps, dtype=int)
+        X_fit = X[indices]
+
     hmm = GaussianHMM(
         n_components=n_states,
         covariance_type="diag",
         n_iter=max_iter,
-        random_state=random_state
+        tol=1e-2,
+        random_state=random_state,
+        verbose=False
     )
-    hmm.fit(X)
+    hmm.fit(X_fit)
 
     def _normalize_probs(vec: np.ndarray) -> np.ndarray:
         vec = np.nan_to_num(vec.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
@@ -259,8 +288,9 @@ def hmm_impute(data: pd.DataFrame,
 
 
 def mice_impute(data: pd.DataFrame,
-                max_iter: int = 10,
+                max_iter: int = 5,
                 n_nearest_features: Optional[int] = None,
+                max_rows: Optional[int] = 200,
                 seed: int = 42) -> pd.DataFrame:
     """
     Impute missing values using MICE (Multiple Imputation by Chained Equations).
@@ -283,16 +313,30 @@ def mice_impute(data: pd.DataFrame,
     if len(data) < 2 or data.shape[1] < 1:
         return data.copy()
 
+    rng = np.random.default_rng(seed)
+    n_features = data.shape[1]
+    if n_nearest_features is None:
+        n_nearest = min(5, n_features)
+    else:
+        n_nearest = min(n_nearest_features, n_features)
+
     try:
         imputer = IterativeImputer(
             max_iter=max_iter,
-            n_nearest_features=n_nearest_features,
+            n_nearest_features=n_nearest,
             random_state=seed,
             initial_strategy='mean',
-            skip_complete=True
+            skip_complete=True,
+            sample_posterior=False
         )
 
-        imputed_values = imputer.fit_transform(data.values)
+        fit_values = data.values
+        if max_rows is not None and len(data) > max_rows:
+            subset_idx = rng.choice(len(data), size=max_rows, replace=False)
+            fit_values = data.iloc[subset_idx].values
+
+        imputer.fit(fit_values)
+        imputed_values = imputer.transform(data.values)
         imputed = pd.DataFrame(
             imputed_values,
             index=data.index,
@@ -326,6 +370,28 @@ def impute(data: pd.DataFrame, method: ImputationMethod, **kwargs):
         raise ValueError(f"Unknown imputation method: {method}")
 
 
+@contextmanager
+def tqdm_joblib(tqdm_object):
+    """Context manager to patch joblib to report into tqdm progress bars."""
+    class TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
+        def __call__(self, *args, **kwargs):
+            tqdm_object.update(n=self.batch_size)
+            return super().__call__(*args, **kwargs)
+
+    old_callback = joblib.parallel.BatchCompletionCallBack
+    joblib.parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+    try:
+        yield tqdm_object
+    finally:
+        joblib.parallel.BatchCompletionCallBack = old_callback
+        tqdm_object.close()
+
+
+def _impute_single_patient(pid, mdata, method, kwargs):
+    df = mdata.data if hasattr(mdata, 'data') else mdata
+    return pid, impute(df, method, **kwargs)
+
+
 def impute_patient_timeseries(masked_data: Dict,
                                method: ImputationMethod,
                                **kwargs) -> Dict[int, pd.DataFrame]:
@@ -336,16 +402,45 @@ def impute_patient_timeseries(masked_data: Dict,
         Dict[patient_id, imputed DataFrame]
     """
     imputed_data = {}
+    if not masked_data:
+        return imputed_data
 
-    for pid, mdata in masked_data.items():
-        if hasattr(mdata, 'data'):
-            # MaskedData object
-            df = mdata.data
+    show_progress = kwargs.pop('show_progress', True)
+    progress_desc = kwargs.pop('progress_desc', f"{method.value} imputation")
+
+    n_jobs = kwargs.pop('n_jobs', None)
+    if n_jobs is None:
+        if method == ImputationMethod.GAUSSIAN_PROCESS:
+            cpu_count = os.cpu_count() or 1
+            n_jobs = max(1, min(cpu_count, 4))
         else:
-            # Plain DataFrame
-            df = mdata
+            n_jobs = 1
+    else:
+        n_jobs = max(1, n_jobs)
 
-        imputed_data[pid] = impute(df, method, **kwargs)
+    items = list(masked_data.items())
+    n_jobs = min(n_jobs, len(items))
+
+    if n_jobs == 1:
+        iterator = tqdm(items, desc=progress_desc, unit="patient") if show_progress else items
+        for pid, mdata in iterator:
+            pid_result, df = _impute_single_patient(pid, mdata, method, kwargs)
+            imputed_data[pid_result] = df
+        if show_progress:
+            iterator.close()
+    else:
+        if show_progress:
+            with tqdm_joblib(tqdm(total=len(items), desc=progress_desc, unit="patient")):
+                results = Parallel(n_jobs=n_jobs)(
+                    delayed(_impute_single_patient)(pid, mdata, method, kwargs)
+                    for pid, mdata in items
+                )
+        else:
+            results = Parallel(n_jobs=n_jobs)(
+                delayed(_impute_single_patient)(pid, mdata, method, kwargs)
+                for pid, mdata in items
+            )
+        imputed_data = {pid: df for pid, df in results}
 
     return imputed_data
 
