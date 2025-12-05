@@ -245,15 +245,28 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
                 return patient_row.iloc[0].to_dict()
         return None
 
+    def to_wide_with_static(pid, ts):
+        if pivot_fn is not None:
+            wide = pivot_fn(ts)
+        else:
+            wide = ts.copy()
+
+        patient_info = get_patient_info(pid)
+        if patient_info:
+            for col, val in patient_info.items():
+                if col == "RecordID":
+                    continue
+                if col in wide.columns:
+                    wide[col] = wide[col].fillna(val)
+                else:
+                    wide[col] = val
+        return wide
+
     if strategy == MaskingStrategy.SEQUENCE_END:
         # Patient-wise masking
         masked_data = {}
         for i, (pid, ts) in enumerate(timeseries.items()):
-            if pivot_fn is not None:
-                patient_info = get_patient_info(pid)
-                wide_ts = pivot_fn(ts, patient_info)
-            else:
-                wide_ts = ts
+            wide_ts = to_wide_with_static(pid, ts)
 
             if len(wide_ts) == 0:
                 masked_data[pid] = MaskedData(
@@ -263,8 +276,8 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
                 )
                 continue
 
-            # Mask only the temporal features (not Age, Gender, Height, ICUType)
-            masked_data[pid] = sequence_end_mask_patient(wide_ts[features], mask_ratio)
+            temporal_df = wide_ts.reindex(columns=features)
+            masked_data[pid] = sequence_end_mask_patient(temporal_df, mask_ratio)
             # Add back static features to the masked data
             for col in wide_ts.columns:
                 if col not in features and col in wide_ts.columns:
@@ -280,11 +293,7 @@ def mask_dataset(timeseries: Dict[int, pd.DataFrame],
         # First, convert all patient data to flat DataFrame
         rows = []
         for pid, ts in timeseries.items():
-            if pivot_fn is not None:
-                patient_info = get_patient_info(pid)
-                wide_ts = pivot_fn(ts, patient_info)
-            else:
-                wide_ts = ts
+            wide_ts = to_wide_with_static(pid, ts)
 
             if len(wide_ts) == 0:
                 continue

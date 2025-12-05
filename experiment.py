@@ -53,6 +53,8 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
                               imputed_data: Dict[int, pd.DataFrame],
                               temporal_features: List[str] = None) -> tuple:
     """Collect all actual and predicted values from masked positions.
+    
+    Applies the same 20% outlier filter as evaluate_patient_imputation.
 
     Args:
         masked_data: Dict mapping patient_id to MaskedData
@@ -75,6 +77,10 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
 
         original = mdata.original
         mask = mdata.mask
+        
+        # First pass: collect all patient data
+        patient_actual = []
+        patient_predicted = []
 
         for col in original.columns:
             # Skip if not a temporal feature (when specified)
@@ -92,17 +98,58 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
 
             # Filter NaN
             valid = ~(np.isnan(actual) | np.isnan(predicted))
-            actual = actual[valid]
-            predicted = predicted[valid]
+            patient_actual.extend(actual[valid])
+            patient_predicted.extend(predicted[valid])
 
-            if len(actual) > 0:
-                all_actual.extend(actual)
-                all_predicted.extend(predicted)
+        # Apply per-patient outlier filter (same as evaluation)
+        if len(patient_actual) > 0:
+            patient_actual = np.array(patient_actual)
+            patient_predicted = np.array(patient_predicted)
+            
+            y_min = patient_actual.min()
+            y_max = patient_actual.max()
+            y_range = y_max - y_min
+            margin = y_range * 0.2
+            range_mask = (patient_predicted >= (y_min - margin)) & (patient_predicted <= (y_max + margin))
+            
+            patient_actual = patient_actual[range_mask]
+            patient_predicted = patient_predicted[range_mask]
+            
+            all_actual.extend(patient_actual)
+            all_predicted.extend(patient_predicted)
+        
+        # Second pass: collect per-variable with same filter applied per variable
+        for col in original.columns:
+            if temporal_features is not None and col not in temporal_features:
+                continue
+            if col not in mask.columns:
+                continue
+
+            col_mask = mask[col]
+            if col_mask.sum() == 0:
+                continue
+
+            actual = original[col].values[col_mask.values]
+            predicted = imputed[col].values[col_mask.values]
+
+            valid = ~(np.isnan(actual) | np.isnan(predicted))
+            actual_valid = actual[valid]
+            predicted_valid = predicted[valid]
+            
+            # Apply per-variable outlier filter
+            if len(actual_valid) > 0:
+                y_min = actual_valid.min()
+                y_max = actual_valid.max()
+                y_range = y_max - y_min
+                margin = y_range * 0.2
+                range_mask = (predicted_valid >= (y_min - margin)) & (predicted_valid <= (y_max + margin))
+                actual_valid = actual_valid[range_mask]
+                predicted_valid = predicted_valid[range_mask]
 
                 if col not in per_variable:
                     per_variable[col] = {'actual': [], 'predicted': []}
-                per_variable[col]['actual'].extend(actual)
-                per_variable[col]['predicted'].extend(predicted)
+                per_variable[col]['actual'].extend(actual_valid)
+                per_variable[col]['predicted'].extend(predicted_valid)
 
     return np.array(all_actual), np.array(all_predicted), per_variable
 
@@ -110,14 +157,41 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
 def plot_overall_scatter(actual: np.ndarray, predicted: np.ndarray,
                          config: ExperimentConfig, output_path: Path) -> None:
     """Create overall predicted vs actual scatter plot."""
+    # Outlier filter already applied in collect_actual_predicted
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    ax.scatter(actual, predicted, alpha=0.3, s=10, c='steelblue')
+    # Use hexbin for better visualization of dense regions
+    # Calculate point density for coloring
+    from scipy.stats import gaussian_kde
+    if len(actual) > 2:
+        try:
+            xy = np.vstack([actual, predicted])
+            z = gaussian_kde(xy)(xy)
+            # Sort points by density so dense points are plotted last
+            idx = z.argsort()
+            actual_sorted, predicted_sorted, z_sorted = actual[idx], predicted[idx], z[idx]
+            scatter = ax.scatter(actual_sorted, predicted_sorted, c=z_sorted, s=10, 
+                                alpha=0.5, cmap='viridis', edgecolors='none')
+            plt.colorbar(scatter, ax=ax, label='Point Density')
+        except:
+            # Fallback to regular scatter if KDE fails
+            ax.scatter(actual, predicted, alpha=0.3, s=10, c='steelblue')
+    else:
+        ax.scatter(actual, predicted, alpha=0.3, s=10, c='steelblue')
 
     # Perfect prediction line
     min_val = min(actual.min(), predicted.min())
     max_val = max(actual.max(), predicted.max())
-    ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+    ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction', zorder=10)
+
+    # Set axis limits to focus on central 99% of data (remove extreme outliers from view)
+    actual_p1, actual_p99 = np.percentile(actual, [1, 99])
+    predicted_p1, predicted_p99 = np.percentile(predicted, [1, 99])
+    axis_min = min(actual_p1, predicted_p1)
+    axis_max = max(actual_p99, predicted_p99)
+    margin = (axis_max - axis_min) * 0.1
+    ax.set_xlim(axis_min - margin, axis_max + margin)
+    ax.set_ylim(axis_min - margin, axis_max + margin)
 
     # Compute metrics for annotation
     mae = np.mean(np.abs(predicted - actual))
@@ -128,7 +202,7 @@ def plot_overall_scatter(actual: np.ndarray, predicted: np.ndarray,
 
     # Add text box with metrics
     textstr = f'MAE: {mae:.4f}\nRMSE: {rmse:.4f}\nR²: {r2:.4f}\nN: {len(actual)}'
-    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.9)
     ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=10,
             verticalalignment='top', bbox=props)
 
@@ -137,6 +211,7 @@ def plot_overall_scatter(actual: np.ndarray, predicted: np.ndarray,
     ax.set_title(f'Overall: {config.imputation_method.value} with {config.masking_strategy.value} masking',
                  fontsize=14)
     ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')

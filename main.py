@@ -15,6 +15,8 @@ Under three masking strategies:
 
 from pathlib import Path
 import os
+import json
+import argparse
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
@@ -23,13 +25,16 @@ from typing import Dict, List, Tuple
 from dataloader import load_physionet_data, print_data_summary, load_raw_dataset, filter_features_by_missingness, filter_patient_timeseries, TEMPORAL_FEATURES, pivot_timeseries
 from masking import MaskingStrategy, mask_dataset
 from imputation import ImputationMethod, impute_patient_timeseries
-from evaluation import evaluate_patient_imputation
+from evaluation import evaluate_patient_imputation, PatientMetrics
 from experiment import (
     ExperimentConfig,
     run_experiment,
     run_experiment_grid,
     print_results_table,
-    summarize_results
+    summarize_results,
+    collect_actual_predicted,
+    plot_overall_scatter,
+    plot_per_variable_scatter
 )
 
 
@@ -73,8 +78,8 @@ def tune_hyperparameters(train_data: Dict[int, pd.DataFrame],
             'n_nearest_features': [None, 5, 10]
         },
         ImputationMethod.HMM: {
-            'n_states': [2, 4, 6, 8],
-            'max_iter': [50, 100, 200]
+            'n_states': [2, 3],
+            'max_iter': [30, 50]
         }
     }
 
@@ -216,6 +221,146 @@ def load_combined_data(data_dir: Path,
     return train_data, train_patient_ids, test_data, test_patient_ids, features_info
 
 
+def save_metrics_artifacts(metrics: PatientMetrics,
+                           output_dir: Path,
+                           prefix: str) -> None:
+    """Persist overall, per-variable, and per-patient metrics."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    overall_df = pd.DataFrame([{
+        'mae': metrics.overall.mae,
+        'mse': metrics.overall.mse,
+        'rmse': metrics.overall.rmse,
+        'r2': metrics.overall.r2,
+        'n_evaluated': metrics.overall.n_evaluated
+    }])
+    overall_df.to_excel(output_dir / f"{prefix}_overall_metrics.xlsx", index=False)
+
+    if metrics.per_variable:
+        var_rows = []
+        for var, m in metrics.per_variable.items():
+            var_rows.append({
+                'variable': var,
+                'mae': m.mae,
+                'mse': m.mse,
+                'rmse': m.rmse,
+                'r2': m.r2,
+                'n_evaluated': m.n_evaluated
+            })
+        pd.DataFrame(var_rows).to_excel(output_dir / f"{prefix}_per_variable_metrics.xlsx", index=False)
+
+    if metrics.per_patient:
+        patient_rows = []
+        for pid, m in metrics.per_patient.items():
+            patient_rows.append({
+                'patient_id': pid,
+                'mae': m.mae,
+                'mse': m.mse,
+                'rmse': m.rmse,
+                'r2': m.r2,
+                'n_evaluated': m.n_evaluated
+            })
+        pd.DataFrame(patient_rows).to_excel(output_dir / f"{prefix}_per_patient_metrics.xlsx", index=False)
+
+
+def save_imputed_timeseries(imputed_data: Dict[int, pd.DataFrame],
+                            features: List[str],
+                            output_dir: Path,
+                            prefix: str) -> None:
+    """Save flattened imputed time series for inspection."""
+    rows = []
+    for pid, df in imputed_data.items():
+        if df is None or df.empty:
+            continue
+        for t, row in df.iterrows():
+            row_dict = {'patient_id': pid, 'time_hours': t}
+            for feat in features:
+                row_dict[feat] = row[feat] if feat in df.columns else np.nan
+            rows.append(row_dict)
+
+    if rows:
+        out_df = pd.DataFrame(rows).sort_values(['patient_id', 'time_hours'])
+        out_df.to_csv(output_dir / f"{prefix}_imputed_data.csv", index=False)
+
+
+def save_tuning_run(masking_strategy: MaskingStrategy,
+                    method: ImputationMethod,
+                    metrics: PatientMetrics,
+                    masked_data: Dict,
+                    imputed_data: Dict[int, pd.DataFrame],
+                    features: List[str],
+                    best_params: Dict,
+                    output_dir: Path) -> None:
+    """Save artifacts for a single masking/method run in tuning mode."""
+    combo_dir = output_dir / "tuned_runs" / f"{masking_strategy.name}_{method.name}"
+    combo_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix = f"{masking_strategy.value}_{method.value}"
+    save_metrics_artifacts(metrics, combo_dir, prefix)
+    save_imputed_timeseries(imputed_data, features, combo_dir, prefix)
+
+    # Generate plots
+    actual, predicted, per_var = collect_actual_predicted(masked_data, imputed_data, features)
+    if len(actual) > 0:
+        from experiment import ExperimentConfig
+        config = ExperimentConfig(
+            masking_strategy=masking_strategy,
+            imputation_method=method,
+            mask_ratio=0.2,
+            seed=42
+        )
+        plot_overall_scatter(actual, predicted, config, combo_dir / f"{prefix}_overall_scatter.png")
+        plot_per_variable_scatter(per_var, config, combo_dir / f"{prefix}_per_variable_scatter.png")
+
+    summary_payload = {
+        'masking_strategy': masking_strategy.name,
+        'imputation_method': method.name,
+        'best_params': best_params,
+        'overall': {
+            'mae': metrics.overall.mae,
+            'mse': metrics.overall.mse,
+            'rmse': metrics.overall.rmse,
+            'r2': metrics.overall.r2,
+            'n_evaluated': metrics.overall.n_evaluated
+        }
+    }
+    (combo_dir / f"{prefix}_summary.json").write_text(json.dumps(summary_payload, indent=2, default=str))
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(
+        description="Run PhysioNet imputation experiments."
+    )
+    parser.add_argument(
+        "--masking-strategies",
+        nargs="+",
+        choices=[m.value for m in MaskingStrategy],
+        help="Subset of masking strategies to evaluate (default: all)."
+    )
+    parser.add_argument(
+        "--imputation-methods",
+        nargs="+",
+        choices=[m.value for m in ImputationMethod],
+        help="Subset of imputation methods to evaluate (default: all)."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["tune", "validate"],
+        help="Override default mode (tune = hyperparameter tuning, validate = validation only)."
+    )
+    parser.add_argument(
+        "--mask-ratio",
+        type=float,
+        help="Override default mask ratio (0-1)."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Override default random seed."
+    )
+    return parser.parse_args()
+
+
 def main():
     DATA_DIR = Path(__file__).parent / "data"
     OUTPUT_DIR = Path(__file__).parent / "output"
@@ -259,6 +404,23 @@ def main():
         ImputationMethod.MICE,
         ImputationMethod.HMM
     ]
+
+    args = parse_cli_args()
+
+    if args.mode is not None:
+        TUNE = args.mode == "tune"
+
+    if args.mask_ratio is not None:
+        MASK_RATIO = args.mask_ratio
+
+    if args.seed is not None:
+        SEED = args.seed
+
+    if args.masking_strategies:
+        MASKING_STRATEGIES = [MaskingStrategy(value) for value in args.masking_strategies]
+
+    if args.imputation_methods:
+        IMPUTATION_METHODS = [ImputationMethod(value) for value in args.imputation_methods]
 
     # =========================================================================
     # LOAD DATA
@@ -334,6 +496,17 @@ def main():
 
                     # Evaluate
                     test_metrics = evaluate_patient_imputation(masked_test, imputed_test)
+
+                    save_tuning_run(
+                        masking_strategy=masking_strategy,
+                        method=method,
+                        metrics=test_metrics,
+                        masked_data=masked_test,
+                        imputed_data=imputed_test,
+                        features=features_info['temporal_features'],
+                        best_params=best_params,
+                        output_dir=OUTPUT_DIR
+                    )
 
                     # Store results
                     result_dict = {

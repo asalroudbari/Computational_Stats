@@ -19,6 +19,7 @@ from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 import warnings
+import logging
 import joblib
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
@@ -26,6 +27,8 @@ from tqdm.auto import tqdm
 try:
     from hmmlearn.hmm import GaussianHMM
     _HMMLEARN_AVAILABLE = True
+    # Suppress hmmlearn convergence warnings
+    logging.getLogger('hmmlearn').setLevel(logging.ERROR)
 except ImportError:
     _HMMLEARN_AVAILABLE = False
 
@@ -204,10 +207,12 @@ def gaussian_process_impute(data: pd.DataFrame,
 
 
 def hmm_impute(data: pd.DataFrame,
-               n_states: int = 4,
+               n_states: int = 3,
                max_iter: int = 50,
-               max_time_steps: Optional[int] = 300,
-               random_state: int = 42) -> pd.DataFrame:
+               max_time_steps: Optional[int] = 200,
+               tol: float = 5e-3,
+               random_state: int = 42,
+               n_init: int = 1) -> pd.DataFrame:
     """
     Impute missing values using a Gaussian Hidden Markov Model.
 
@@ -238,6 +243,8 @@ def hmm_impute(data: pd.DataFrame,
     filled = filled.fillna(0.0)
 
     X = filled.values.astype(float)
+    if len(X) <= 1:
+        return data.copy()
 
     X_fit = X
     if max_time_steps is not None and len(X) > max_time_steps:
@@ -245,18 +252,41 @@ def hmm_impute(data: pd.DataFrame,
         indices = np.linspace(0, len(X) - 1, max_time_steps, dtype=int)
         X_fit = X[indices]
 
-    hmm = GaussianHMM(
-        n_components=n_states,
-        covariance_type="diag",
-        n_iter=max_iter,
-        tol=1e-2,
-        random_state=random_state,
-        verbose=False
-    )
-    hmm.fit(X_fit)
+    n_components = max(1, min(n_states, len(X_fit) - 1))
+    if n_components == 0:
+        return data.copy()
+
+    best_hmm = None
+    best_score = -np.inf
+    train_failed = False
+    for init_idx in range(max(1, n_init)):
+        hmm = GaussianHMM(
+            n_components=n_components,
+            covariance_type="diag",
+            n_iter=max_iter,
+            tol=tol,
+            random_state=random_state + init_idx,
+            verbose=False
+        )
+        try:
+            hmm.fit(X_fit)
+            score = hmm.score(X_fit)
+        except ValueError:
+            train_failed = True
+            continue
+        if score > best_score or best_hmm is None:
+            best_score = score
+            best_hmm = hmm
+
+    if best_hmm is None:
+        # If all initializations failed, return the filled data as fallback
+        return filled
+
+    hmm = best_hmm
 
     def _normalize_probs(vec: np.ndarray) -> np.ndarray:
         vec = np.nan_to_num(vec.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+        vec = vec + 1e-6
         total = vec.sum()
         if total <= 0 or not np.isfinite(total):
             vec = np.full_like(vec, 1.0 / len(vec))
