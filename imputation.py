@@ -321,7 +321,8 @@ def mice_impute(data: pd.DataFrame,
                 max_iter: int = 5,
                 n_nearest_features: Optional[int] = None,
                 max_rows: Optional[int] = 200,
-                seed: int = 42) -> pd.DataFrame:
+                seed: int = 42,
+                use_time_feature: bool = True) -> pd.DataFrame:
     """
     Impute missing values using MICE (Multiple Imputation by Chained Equations).
 
@@ -332,7 +333,9 @@ def mice_impute(data: pd.DataFrame,
         data: DataFrame with time as index, variables as columns
         max_iter: Maximum number of imputation iterations
         n_nearest_features: Number of features to use for imputation (None = all)
+        max_rows: Maximum number of rows to use for fitting (None = all)
         seed: Random seed
+        use_time_feature: Add time as predictor to improve extrapolation (default: True)
 
     Returns:
         DataFrame with missing values imputed
@@ -344,7 +347,20 @@ def mice_impute(data: pd.DataFrame,
         return data.copy()
 
     rng = np.random.default_rng(seed)
-    n_features = data.shape[1]
+
+    # Add time as a feature (normalized) to help with temporal patterns
+    data_with_time = data.copy()
+    if use_time_feature and len(data.index) > 0:
+        # Normalize time to [0, 1] range
+        time_values = data.index.values.astype(float)
+        time_min, time_max = time_values.min(), time_values.max()
+        if time_max > time_min:
+            time_normalized = (time_values - time_min) / (time_max - time_min)
+        else:
+            time_normalized = np.zeros(len(time_values))
+        data_with_time['_time_feature'] = time_normalized
+
+    n_features = data_with_time.shape[1]
     if n_nearest_features is None:
         n_nearest = min(5, n_features)
     else:
@@ -360,13 +376,18 @@ def mice_impute(data: pd.DataFrame,
             sample_posterior=False
         )
 
-        fit_values = data.values
-        if max_rows is not None and len(data) > max_rows:
-            subset_idx = rng.choice(len(data), size=max_rows, replace=False)
-            fit_values = data.iloc[subset_idx].values
+        fit_values = data_with_time.values
+        if max_rows is not None and len(data_with_time) > max_rows:
+            subset_idx = rng.choice(len(data_with_time), size=max_rows, replace=False)
+            fit_values = data_with_time.iloc[subset_idx].values
 
         imputer.fit(fit_values)
-        imputed_values = imputer.transform(data.values)
+        imputed_values = imputer.transform(data_with_time.values)
+
+        # Remove time feature from results
+        if use_time_feature:
+            imputed_values = imputed_values[:, :-1]
+
         imputed = pd.DataFrame(
             imputed_values,
             index=data.index,

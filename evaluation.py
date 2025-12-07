@@ -56,18 +56,6 @@ def compute_metrics(original: pd.DataFrame,
     y_true = y_true[valid_mask]
     y_pred = y_pred[valid_mask]
 
-    # Filter predictions that are too far outside the actual range
-    # Only keep predictions within 1.2x the actual data range
-    if len(y_true) > 0:
-        y_min = y_true.min()
-        y_max = y_true.max()
-        y_range = y_max - y_min
-        margin = y_range * 0.2
-
-        range_mask = (y_pred >= (y_min - margin)) & (y_pred <= (y_max + margin))
-        y_true = y_true[range_mask]
-        y_pred = y_pred[range_mask]
-
     n = len(y_true)
 
     if n == 0:
@@ -117,18 +105,6 @@ def compute_metrics_per_variable(original: pd.DataFrame,
         # Filter NaN
         valid = ~(np.isnan(y_true) | np.isnan(y_pred))
         y_true, y_pred = y_true[valid], y_pred[valid]
-
-        # Filter predictions that are too far outside the actual range
-        # Only keep predictions within 1.2x the actual data range
-        if len(y_true) > 0:
-            y_min = y_true.min()
-            y_max = y_true.max()
-            y_range = y_max - y_min
-            margin = y_range * 0.2
-
-            range_mask = (y_pred >= (y_min - margin)) & (y_pred <= (y_max + margin))
-            y_true = y_true[range_mask]
-            y_pred = y_pred[range_mask]
 
         n = len(y_true)
         if n == 0:
@@ -197,16 +173,6 @@ def evaluate_patient_imputation(masked_data: Dict,
             y_true_valid = y_true[valid]
             y_pred_valid = y_pred[valid]
 
-            # Filter predictions that are too far outside the actual range
-            if len(y_true_valid) > 0:
-                y_min = y_true_valid.min()
-                y_max = y_true_valid.max()
-                y_range = y_max - y_min
-                margin = y_range * 0.2
-                range_mask = (y_pred_valid >= (y_min - margin)) & (y_pred_valid <= (y_max + margin))
-                y_true_valid = y_true_valid[range_mask]
-                y_pred_valid = y_pred_valid[range_mask]
-
             per_variable_agg[var]['y_true'].extend(y_true_valid)
             per_variable_agg[var]['y_pred'].extend(y_pred_valid)
 
@@ -216,16 +182,6 @@ def evaluate_patient_imputation(masked_data: Dict,
         valid = ~(np.isnan(y_true) | np.isnan(y_pred))
         y_true_valid = y_true[valid]
         y_pred_valid = y_pred[valid]
-
-        # Filter predictions that are too far outside the actual range
-        if len(y_true_valid) > 0:
-            y_min = y_true_valid.min()
-            y_max = y_true_valid.max()
-            y_range = y_max - y_min
-            margin = y_range * 0.2
-            range_mask = (y_pred_valid >= (y_min - margin)) & (y_pred_valid <= (y_max + margin))
-            y_true_valid = y_true_valid[range_mask]
-            y_pred_valid = y_pred_valid[range_mask]
 
         all_y_true.extend(y_true_valid)
         all_y_pred.extend(y_pred_valid)

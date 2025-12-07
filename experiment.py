@@ -53,13 +53,14 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
                               imputed_data: Dict[int, pd.DataFrame],
                               temporal_features: List[str] = None) -> tuple:
     """Collect all actual and predicted values from masked positions.
-    
-    Applies the same 20% outlier filter as evaluate_patient_imputation.
 
     Args:
         masked_data: Dict mapping patient_id to MaskedData
         imputed_data: Dict mapping patient_id to imputed DataFrame
         temporal_features: List of temporal features to include (if None, all)
+
+    Returns:
+        Tuple of (all_actual, all_predicted, per_variable)
     """
     all_actual = []
     all_predicted = []
@@ -101,20 +102,8 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
             patient_actual.extend(actual[valid])
             patient_predicted.extend(predicted[valid])
 
-        # Apply per-patient outlier filter (same as evaluation)
+        # Collect all patient data without filtering
         if len(patient_actual) > 0:
-            patient_actual = np.array(patient_actual)
-            patient_predicted = np.array(patient_predicted)
-            
-            y_min = patient_actual.min()
-            y_max = patient_actual.max()
-            y_range = y_max - y_min
-            margin = y_range * 0.2
-            range_mask = (patient_predicted >= (y_min - margin)) & (patient_predicted <= (y_max + margin))
-            
-            patient_actual = patient_actual[range_mask]
-            patient_predicted = patient_predicted[range_mask]
-            
             all_actual.extend(patient_actual)
             all_predicted.extend(patient_predicted)
         
@@ -135,17 +124,9 @@ def collect_actual_predicted(masked_data: Dict[int, MaskedData],
             valid = ~(np.isnan(actual) | np.isnan(predicted))
             actual_valid = actual[valid]
             predicted_valid = predicted[valid]
-            
-            # Apply per-variable outlier filter
-            if len(actual_valid) > 0:
-                y_min = actual_valid.min()
-                y_max = actual_valid.max()
-                y_range = y_max - y_min
-                margin = y_range * 0.2
-                range_mask = (predicted_valid >= (y_min - margin)) & (predicted_valid <= (y_max + margin))
-                actual_valid = actual_valid[range_mask]
-                predicted_valid = predicted_valid[range_mask]
 
+            # Collect per-variable data without filtering
+            if len(actual_valid) > 0:
                 if col not in per_variable:
                     per_variable[col] = {'actual': [], 'predicted': []}
                 per_variable[col]['actual'].extend(actual_valid)
